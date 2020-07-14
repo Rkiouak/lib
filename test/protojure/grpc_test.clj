@@ -546,6 +546,20 @@
       (grpc/disconnect client)
       (is (-> (<!! closedetect-ch) (= input))))))
 
+(deftest client-idle-timeout
+  (testing "Check that idle-timeout properly sets client timeout"
+    (let [input (async/chan 1)
+          output (async/chan 16)
+          client @(grpc.http2/connect {:uri               (str "http://localhost:" (:port @test-env))
+                                       :idle-timeout      1
+                                       :input-buffer-size 128})]
+      (try @(test.client/Async client {:id input})
+           (catch Exception e
+             ;; Note this test receives a slightly different error when run exclusively via e.g.
+             ;; `lein test :only <ns>/client-idle-timeout`
+             (is (= "Idle timeout expired: 1/1 ms"
+                    (:cause (Throwable->map e)))))))))
+
 (deftest test-grpc-metadata
   (testing "Check that connection-metadata is sent to the server"
     (let [client @(grpc.http2/connect {:uri (str "http://localhost:" (:port @test-env)) :metadata {"authorization" "Magic"}})]
