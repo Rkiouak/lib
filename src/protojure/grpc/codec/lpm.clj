@@ -130,7 +130,7 @@ The value for the **content-coding** option must be one of
 
 
 "
-  [f input output {:keys [codecs content-coding tmo] :or {codecs compression/builtin-codecs tmo 5000} :as options}]
+  [f input output {:keys [codecs content-coding tmo cancel] :or {codecs compression/builtin-codecs tmo 5000} :as options}]
   (let [is (InputStream. {:ch input :tmo tmo})
         decompressor (when (and (some? content-coding) (not= content-coding "identity"))
                        (compression/decompressor codecs content-coding))]
@@ -139,6 +139,8 @@ The value for the **content-coding** option must be one of
        (go
          (try
            (loop [acc []]
+             (when (and cancel (realized? cancel))
+               (reject @cancel))
              (if-let [data (<! input)]
                (let [[acc msg] (_decode f is acc data decompressor)]
                  (when (some? msg)

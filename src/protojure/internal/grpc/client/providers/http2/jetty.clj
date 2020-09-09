@@ -42,7 +42,10 @@
                  (resolve result))
                (failed [_ error]
                  (reject error)))]
-       (f p)))))
+       (try
+         (f p)
+         (catch Exception e
+           (p/rejected e)))))))
 
 (defn- jetty-callback-promise
   "converts a jetty 'callback' to promesa"
@@ -54,7 +57,10 @@
                   (resolve true))
                 (failed [_ error]
                   (reject error)))]
-       (f cb)))))
+       (try
+         (f cb)
+         (catch Exception e
+           (reject e)))))))
 
 (defn- ->fields
   "converts a map of [string string] name/value attributes to a jetty HttpFields container"
@@ -138,30 +144,54 @@
 
 (defn- transmit-data-frame
   "Transmits a single DATA frame"
-  ([stream data]
-   (transmit-data-frame stream data false 0))
-  ([^Stream stream data last? padding]
+  ([stream data cancel]
+   (transmit-data-frame stream data false 0 cancel))
+  ([^Stream stream data last? padding cancel]
    (stream-log :trace stream "Sending DATA-FRAME with " (count data) " bytes, ENDFRAME=" last?)
-   @(jetty-callback-promise
-     (fn [cb]
-       (let [frame (DataFrame. (.getId stream) (ByteBuffer/wrap data) last? padding)]
-         (.data stream frame cb))))))
+   (-> @(jetty-callback-promise
+       (fn [cb]
+         (let [frame (DataFrame. (.getId stream) (ByteBuffer/wrap data) last? padding)]
+           (.data stream frame cb))))
+        (p/catch
+          (fn [e]
+            (p/rejected e))))))
 
 (defn- transmit-eof
   "Transmits an empty DATA frame with the ENDSTREAM flag set to true, signifying the end of stream"
-  [stream]
-  (transmit-data-frame stream (byte-array 0) true 0))
+  [stream cancel]
+  (transmit-data-frame stream (byte-array 0) true 0 cancel))
 
-(defn- transmit-data-frames
+(defn transmit-data-frames
   "Creates DATA frames from the buffers on the channel"
-  [input stream]
-  (when (some? input)
-    (go-loop []
-      (if-let [frame (<! input)]
-        (do
-          (transmit-data-frame stream frame)
-          (recur))
-        (transmit-eof stream)))))
+  [input cancel stream]
+  (if (some? input)
+    (p/promise
+      (fn [resolve reject]
+        (let [p (promise)]
+          (loop []
+            (async/thread
+             (when (realized? cancel)
+               (reject @cancel))
+             (when (not (realized? p))
+               (recur))))
+          (go-loop []
+           (if-let [frame (<! input)]
+             (do
+               (try
+                 (transmit-data-frame stream frame cancel)
+                 (catch Exception e
+                   (deliver cancel e)
+                   (deliver p e)
+                   (reject e)))
+               (recur))
+             (try
+               (deliver p true)
+               (resolve (transmit-eof stream cancel))
+               (catch Exception e
+                 (deliver cancel e)
+                 (deliver p e)
+                 (reject e))))))))
+    (p/resolved true)))
 
 ;;------------------------------------------------------------------------------------
 ;; Exposed API
@@ -193,14 +223,16 @@
 
 (defn send-request
   [{:keys [^Session session] :as context}
-   {:keys [input-ch meta-ch output-ch] :as request}]
+   {:keys [input-ch meta-ch output-ch cancel] :as request}]
   (let [request-frame (build-request request (nil? input-ch))
         listener (receive-listener meta-ch output-ch)]
     (-> (jetty-promise
          (fn [p]
            (.newStream session request-frame p listener)))
-        (p/then (partial transmit-data-frames input-ch))
-        (p/catch (fn [ex] (close-all! meta-ch output-ch) (throw ex))))))
+        (p/catch (fn [ex]
+                   (close-all! meta-ch output-ch)
+                   (deliver cancel ex)
+                   (p/rejected ex))))))
 
 (defn disconnect [{:keys [^HTTP2Client client] :as context}]
   (log/debug "Disconnecting:" context)
